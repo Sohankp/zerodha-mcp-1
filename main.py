@@ -65,94 +65,79 @@ def start_server():
     uvicorn.run(app, host="127.0.0.1", port=5000, log_level="error")
 
 
+import time
+import webbrowser
+
 @asynccontextmanager
 async def zerodha_lifespan(server: FastMCP) -> AsyncIterator[ZerodhaContext]:
-    """Manage application lifecycle for Zerodha integration"""
-    # Initialize Kite Connect
     print("Initializing Zerodha context...")
 
     if not KITE_API_KEY or not KITE_API_SECRET:
-        raise ValueError(
-            "KITE_API_KEY and KITE_API_SECRET must be set in the .env file"
-        )
+        raise ValueError("KITE_API_KEY and KITE_API_SECRET must be set in the .env file")
 
     kite = KiteConnect(api_key=KITE_API_KEY)
-
-    # Try to load existing token
     stored_token = load_stored_token()
+
     if stored_token:
         try:
             kite.set_access_token(stored_token)
-            # Verify token is still valid with a simple API call
             kite.margins()
             print("Successfully restored previous session")
         except Exception:
             print("Stored token is invalid, will wait for new login...")
             if os.path.exists(TOKEN_STORE_PATH):
                 os.remove(TOKEN_STORE_PATH)
+            stored_token = None
 
-    # Create context
+    def run_app():
+        uvicorn.run(app, host="127.0.0.1", port=5000, log_level="info")
+
+    server_thread = Thread(target=run_app, daemon=True)
+    server_thread.start()
+
+    # Define callback route
+    @app.get("/zerodha/auth/redirect")
+    async def callback(request_token: str = None, status: str = None):
+        global _request_token
+
+        if status != "success":
+            raise HTTPException(status_code=400, detail=f"Login failed: {status}")
+        if not request_token:
+            raise HTTPException(status_code=400, detail="No request token received")
+
+        try:
+            data = kite.generate_session(request_token, api_secret=KITE_API_SECRET)
+            access_token = data["access_token"]
+            save_access_token(access_token)
+            kite.set_access_token(access_token)
+            _request_token = request_token
+            print("Login successful")
+            return HTMLResponse("<h1>Login successful! You can close this window.</h1>")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
     ctx = ZerodhaContext(
         kite=kite,
         api_key=KITE_API_KEY,
         api_secret=KITE_API_SECRET,
         app=app,
+        server_thread=server_thread
     )
 
+    if not stored_token:
+        login_url = kite.login_url() + f"&redirect_uri={REDIRECT_URL}"
+        print(f"Please log in: {login_url}")
+        webbrowser.open(login_url)
+
+        # Wait until _request_token is set (i.e., login completes)
+        while _request_token is None:
+            time.sleep(1)
+
     try:
-        # Setup FastAPI endpoint for auth callback
-        @app.get("/zerodha/auth/redirect")
-        async def callback(request_token: str = None, status: str = None):
-            """Handle the redirect from Zerodha login"""
-            global _request_token
-
-            if status != "success":
-                print(f"Login failed with status: {status}")
-                raise HTTPException(
-                    status_code=400, detail=f"Login failed with status: {status}"
-                )
-            if not request_token:
-                print("No request token received")
-                raise HTTPException(status_code=400, detail="No request token received")
-
-            try:
-                # Generate session
-                print("Generating session with request token")
-                data = ctx.kite.generate_session(
-                    request_token, api_secret=ctx.api_secret
-                )
-                access_token = data["access_token"]
-
-                # Save and set the access token
-                print("Saving and setting access token")
-                save_access_token(access_token)
-                ctx.kite.set_access_token(access_token)
-                _request_token = request_token
-                print("Login successful")
-
-                return HTMLResponse(
-                    content="""
-                    <html>
-                        <body style="font-family: Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background-color: #f5f5f5;">
-                            <div style="text-align: center; padding: 2rem; background-color: white; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
-                                <h1 style="color: #2ecc71;">Login Successful!</h1>
-                                <p>You can close this window now.</p>
-                            </div>
-                        </body>
-                    </html>
-                    """
-                )
-            except Exception as e:
-                error_msg = f"Failed to generate session: {str(e)}"
-                print(error_msg)
-                raise HTTPException(status_code=500, detail=error_msg)
-
-        # Yield the context to the tools
         yield ctx
     finally:
-        # Cleanup on shutdown
         print("Shutting down Zerodha context...")
-        # Additional cleanup could go here if needed
+
 
 
 # Initialize FastMCP server with lifespan and dependencies
